@@ -110,9 +110,6 @@ class AzureVideoBlobUploader(io.ComfyNode):
             N, H, W, C = frames.shape
             print(f"[AzureVideoBlobUploader] Encoding {N} frames @ {fps:.3f} fps  ({W}x{H})")
 
-            # Convert to uint8 RGB numpy array — same as image node converts to PNG
-            frames_np = (frames.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-
             # ── Handle audio if present ──────────────────────────────────────
             audio = comp.audio
             audio_url = None
@@ -195,7 +192,37 @@ class AzureVideoBlobUploader(io.ComfyNode):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-            video_bytes, stderr = proc.communicate(input=frames_np.tobytes())
+
+            # ── Read MP4 bytes and write raw frames in chunks ────────────────
+            video_bytes_array = bytearray()
+            
+            import threading
+            def read_output():
+                while True:
+                    chunk = proc.stdout.read(8192)
+                    if not chunk:
+                        break
+                    video_bytes_array.extend(chunk)
+
+            reader_thread = threading.Thread(target=read_output, daemon=True)
+            reader_thread.start()
+
+            # Process and write frames in memory-efficient chunks (e.g., 32 frames at a time)
+            chunk_size = 32
+            try:
+                for start_idx in range(0, N, chunk_size):
+                    end_idx = min(start_idx + chunk_size, N)
+                    chunk_tensor = frames[start_idx:end_idx]
+                    chunk_np = (chunk_tensor.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                    proc.stdin.write(chunk_np.tobytes())
+            except Exception as e:
+                print(f"[AzureVideoBlobUploader] Warning: Error writing frames to ffmpeg: {e}")
+            finally:
+                proc.stdin.close()
+                reader_thread.join()
+                proc.wait()
+
+            video_bytes = bytes(video_bytes_array)
 
             if proc.returncode != 0:
                 err = stderr.decode("utf-8", errors="replace")
