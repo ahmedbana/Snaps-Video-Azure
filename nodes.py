@@ -225,7 +225,7 @@ class AzureVideoBlobUploader(io.ComfyNode):
             video_bytes = bytes(video_bytes_array)
 
             if proc.returncode != 0:
-                err = stderr.decode("utf-8", errors="replace")
+                err = proc.stderr.read().decode("utf-8", errors="replace")
                 return io.NodeOutput(f"❌ Encoding error: {err}")
 
             print(f"[AzureVideoBlobUploader] Encoded {len(video_bytes):,} bytes — uploading to Azure…")
