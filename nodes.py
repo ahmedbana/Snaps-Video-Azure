@@ -11,7 +11,8 @@ import numpy as np
 import imageio_ffmpeg
 import torch
 import torchaudio
-import io as std_io
+import shutil
+import tempfile
 
 from comfy_api.latest import io, Input, InputImpl, Types
 
@@ -110,141 +111,84 @@ class AzureVideoBlobUploader(io.ComfyNode):
             N, H, W, C = frames.shape
             print(f"[AzureVideoBlobUploader] Encoding {N} frames @ {fps:.3f} fps  ({W}x{H})")
 
-            # ── Handle audio if present ──────────────────────────────────────
             audio = comp.audio
-            audio_url = None
+
+            # ── Encode to MP4 via temp files (avoids pipe instability / SIGSEGV)
+            ffmpeg_exe = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
+            print(f"[AzureVideoBlobUploader] Using ffmpeg: {ffmpeg_exe}")
+
+            tmp_dir = tempfile.mkdtemp(prefix="snaps_video_")
+            raw_path = os.path.join(tmp_dir, "input.raw")
+            mp4_path = os.path.join(tmp_dir, "output.mp4")
+
+            # Handle audio: write WAV to temp file instead of uploading to Azure
+            audio_path = None
             if audio is not None:
-                waveform = audio["waveform"]
-                sample_rate = audio["sample_rate"]
+                waveform = comp.audio["waveform"]
+                sample_rate = comp.audio["sample_rate"]
                 if waveform.dim() == 3:
                     waveform = waveform.squeeze(0)
                 elif waveform.dim() == 1:
                     waveform = waveform.unsqueeze(0)
-                
-                # Write standard WAV to memory
-                wav_io = std_io.BytesIO()
-                torchaudio.save(wav_io, waveform.cpu(), sample_rate, format="wav")
-                audio_bytes = wav_io.getvalue()
-                
-                # Upload to Azure so ffmpeg can download it natively
-                timestamp = int(time.time())
-                random_id = str(uuid.uuid4())[:8]
-                audio_filename = (
-                    f"{timestamp}_{generation_id}_{random_id}_audio.wav"
-                    if generation_id
-                    else f"{timestamp}_{random_id}_audio.wav"
-                )
-                
-                upload_audio_url = f"{base_url}{audio_filename}{sas_token}"
-                print(f"[AzureVideoBlobUploader] Uploading temporary audio ({len(audio_bytes)} bytes) to Azure…")
-                
-                headers = {
-                    "x-ms-blob-type": "BlockBlob",
-                    "Content-Type": "audio/wav",
-                }
-                response = requests.put(upload_audio_url, headers=headers, data=audio_bytes)
-                if response.status_code == 201:
-                    audio_url = upload_audio_url
-                else:
-                    print(f"[AzureVideoBlobUploader] Warning: failed to upload temporary audio: {response.text}")
+                audio_path = os.path.join(tmp_dir, "audio.wav")
+                torchaudio.save(audio_path, waveform.cpu(), sample_rate, format="wav")
+                print(f"[AzureVideoBlobUploader] Audio written to temp file: {audio_path}")
 
-            # ── Encode to MP4 bytes in-memory via ffmpeg pipe ────────────────
-            # Prefer system ffmpeg (native to the server OS/glibc) to avoid
-            # SIGSEGV crashes from the static imageio_ffmpeg binary on some
-            # Linux distributions.
-            import shutil
-            ffmpeg_exe = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
-            print(f"[AzureVideoBlobUploader] Using ffmpeg: {ffmpeg_exe}")
-            cmd = [
-                ffmpeg_exe, "-y",
-                "-f", "rawvideo",
-                "-vcodec", "rawvideo",
-                "-s", f"{W}x{H}",
-                "-pix_fmt", "rgb24",
-                "-r", str(fps),
-                "-i", "pipe:0",
-            ]
-            
-            if audio_url:
-                cmd.extend(["-i", audio_url])
-                
-            cmd.extend([
-                "-vcodec", "libx264",
-                "-pix_fmt", "yuv420p",
-                "-preset", "ultrafast",
-                "-crf", "23",
-                "-threads", "2",
-            ])
-            
-            if audio_url:
-                cmd.extend([
-                    "-c:a", "aac",
-                    "-b:a", "192k",
-                    "-shortest"
-                ])
-                
-            cmd.extend([
-                # fragmented MP4: streams directly to pipe without needing seek
-                "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-                "-f", "mp4",
-                "pipe:1",
-            ])
-
-            print(f"[AzureVideoBlobUploader] ffmpeg command: {' '.join(cmd)}")
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-            # ── Read MP4 bytes and write raw frames in chunks ────────────────
-            video_bytes_array = bytearray()
-            
-            import threading
-            stderr_chunks = []
-
-            def read_stdout():
-                while True:
-                    chunk = proc.stdout.read(8192)
-                    if not chunk:
-                        break
-                    video_bytes_array.extend(chunk)
-
-            def read_stderr():
-                while True:
-                    chunk = proc.stderr.read(8192)
-                    if not chunk:
-                        break
-                    stderr_chunks.append(chunk)
-
-            reader_thread = threading.Thread(target=read_stdout, daemon=True)
-            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-            reader_thread.start()
-            stderr_thread.start()
-
-            # Process and write frames in memory-efficient chunks (e.g., 32 frames at a time)
-            chunk_size = 32
             try:
-                for start_idx in range(0, N, chunk_size):
-                    end_idx = min(start_idx + chunk_size, N)
-                    chunk_tensor = frames[start_idx:end_idx]
-                    chunk_np = (chunk_tensor.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                    proc.stdin.write(chunk_np.tobytes())
-            except Exception as e:
-                print(f"[AzureVideoBlobUploader] Warning: Error writing frames to ffmpeg: {e}")
+                # Write raw RGB24 frames to disk in chunks to keep memory low
+                print(f"[AzureVideoBlobUploader] Writing {N} raw frames to {raw_path} …")
+                chunk_size = 32
+                with open(raw_path, "wb") as raw_f:
+                    for start_idx in range(0, N, chunk_size):
+                        end_idx = min(start_idx + chunk_size, N)
+                        chunk_np = (
+                            frames[start_idx:end_idx].cpu().numpy() * 255
+                        ).clip(0, 255).astype(np.uint8)
+                        raw_f.write(chunk_np.tobytes())
+
+                # Build ffmpeg command — reads from file, writes to file (no pipes)
+                cmd = [
+                    ffmpeg_exe, "-y",
+                    "-f", "rawvideo",
+                    "-vcodec", "rawvideo",
+                    "-s", f"{W}x{H}",
+                    "-pix_fmt", "rgb24",
+                    "-r", str(fps),
+                    "-i", raw_path,
+                ]
+                if audio_path:
+                    cmd.extend(["-i", audio_path])
+                cmd.extend([
+                    "-vcodec", "libx264",
+                    "-pix_fmt", "yuv420p",
+                    "-preset", "ultrafast",
+                    "-crf", "23",
+                    "-threads", "2",
+                ])
+                if audio_path:
+                    cmd.extend(["-c:a", "aac", "-b:a", "192k", "-shortest"])
+                cmd.append(mp4_path)
+
+                print(f"[AzureVideoBlobUploader] ffmpeg command: {' '.join(cmd)}")
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                full_stderr = result.stderr.decode("utf-8", errors="replace")
+                print(f"[AzureVideoBlobUploader] ffmpeg stderr:\n{full_stderr}")
+
+                if result.returncode != 0:
+                    return io.NodeOutput(
+                        f"❌ Encoding error (rc={result.returncode}): {full_stderr}"
+                    )
+
+                with open(mp4_path, "rb") as f:
+                    video_bytes = f.read()
+
             finally:
-                proc.stdin.close()
-                reader_thread.join()
-                stderr_thread.join()
-                proc.wait()
-
-            video_bytes = bytes(video_bytes_array)
-            full_stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
-            print(f"[AzureVideoBlobUploader] ffmpeg stderr:\n{full_stderr}")
-
-            if proc.returncode != 0:
-                return io.NodeOutput(f"❌ Encoding error (rc={proc.returncode}): {full_stderr}")
+                # Clean up temp files
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
             print(f"[AzureVideoBlobUploader] Encoded {len(video_bytes):,} bytes — uploading to Azure…")
 
