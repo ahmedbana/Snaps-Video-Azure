@@ -149,9 +149,12 @@ class AzureVideoBlobUploader(io.ComfyNode):
                     print(f"[AzureVideoBlobUploader] Warning: failed to upload temporary audio: {response.text}")
 
             # ── Encode to MP4 bytes in-memory via ffmpeg pipe ────────────────
-            # Pipe raw RGB24 frames → ffmpeg stdin
-            # ffmpeg writes fragmented MP4 to stdout (no temp file, no seek needed)
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            # Prefer system ffmpeg (native to the server OS/glibc) to avoid
+            # SIGSEGV crashes from the static imageio_ffmpeg binary on some
+            # Linux distributions.
+            import shutil
+            ffmpeg_exe = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
+            print(f"[AzureVideoBlobUploader] Using ffmpeg: {ffmpeg_exe}")
             cmd = [
                 ffmpeg_exe, "-y",
                 "-f", "rawvideo",
@@ -168,8 +171,9 @@ class AzureVideoBlobUploader(io.ComfyNode):
             cmd.extend([
                 "-vcodec", "libx264",
                 "-pix_fmt", "yuv420p",
-                "-preset", "fast",
+                "-preset", "ultrafast",
                 "-crf", "23",
+                "-threads", "2",
             ])
             
             if audio_url:
