@@ -197,15 +197,26 @@ class AzureVideoBlobUploader(io.ComfyNode):
             video_bytes_array = bytearray()
             
             import threading
-            def read_output():
+            stderr_chunks = []
+
+            def read_stdout():
                 while True:
                     chunk = proc.stdout.read(8192)
                     if not chunk:
                         break
                     video_bytes_array.extend(chunk)
 
-            reader_thread = threading.Thread(target=read_output, daemon=True)
+            def read_stderr():
+                while True:
+                    chunk = proc.stderr.read(8192)
+                    if not chunk:
+                        break
+                    stderr_chunks.append(chunk)
+
+            reader_thread = threading.Thread(target=read_stdout, daemon=True)
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
             reader_thread.start()
+            stderr_thread.start()
 
             # Process and write frames in memory-efficient chunks (e.g., 32 frames at a time)
             chunk_size = 32
@@ -220,12 +231,13 @@ class AzureVideoBlobUploader(io.ComfyNode):
             finally:
                 proc.stdin.close()
                 reader_thread.join()
+                stderr_thread.join()
                 proc.wait()
 
             video_bytes = bytes(video_bytes_array)
 
             if proc.returncode != 0:
-                err = proc.stderr.read().decode("utf-8", errors="replace")
+                err = b"".join(stderr_chunks).decode("utf-8", errors="replace")
                 return io.NodeOutput(f"❌ Encoding error: {err}")
 
             print(f"[AzureVideoBlobUploader] Encoded {len(video_bytes):,} bytes — uploading to Azure…")
