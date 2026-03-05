@@ -186,6 +186,7 @@ class AzureVideoBlobUploader(io.ComfyNode):
                 "pipe:1",
             ])
 
+            print(f"[AzureVideoBlobUploader] ffmpeg command: {' '.join(cmd)}")
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -235,10 +236,11 @@ class AzureVideoBlobUploader(io.ComfyNode):
                 proc.wait()
 
             video_bytes = bytes(video_bytes_array)
+            full_stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+            print(f"[AzureVideoBlobUploader] ffmpeg stderr:\n{full_stderr}")
 
             if proc.returncode != 0:
-                err = b"".join(stderr_chunks).decode("utf-8", errors="replace")
-                return io.NodeOutput(f"❌ Encoding error: {err}")
+                return io.NodeOutput(f"❌ Encoding error (rc={proc.returncode}): {full_stderr}")
 
             print(f"[AzureVideoBlobUploader] Encoded {len(video_bytes):,} bytes — uploading to Azure…")
 
